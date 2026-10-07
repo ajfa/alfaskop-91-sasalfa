@@ -1,0 +1,330 @@
+--- a/src/devices/machine/hd63450.cpp
++++ b/src/devices/machine/hd63450.cpp
+@@ -496,7 +496,8 @@
+ 			return;
+ 		}
+ 		m_timer[x]->adjust(attotime::never);
+-		m_reg[x].csr |= 0xe0;  // channel operation complete, block transfer complete
++		// a count that runs out is a normal end: COC only; NDT is for a device that ends the transfer early
++		m_reg[x].csr |= 0x80;  // channel operation complete
+ 		m_reg[x].csr &= ~0x08;  // channel no longer active
+ 		m_reg[x].ccr &= ~0xc0;
+ 
+--- a/src/devices/machine/z80sio.cpp
++++ b/src/devices/machine/z80sio.cpp
+@@ -2822,7 +2822,7 @@
+ 		xmtctl |= 0x10;
+ 	if (m_tx_auto_enable)
+ 		xmtctl |= 0x20;
+-	xmtctl |= (m_wr5 & WR5_TX_WORD_LENGTH_MASK) << 1;
++	xmtctl |= (m_wr5 & 0x40) | ((m_wr5 & 0x20) << 2);
+ 	return xmtctl;
+ }
+ 
+@@ -2839,7 +2839,8 @@
+ 		(BIT(data, 2) ? WR5_DTR : 0) |
+ 		(BIT(data, 3) ? WR5_TX_CRC_ENABLE : 0) |
+ 		(BIT(data, 4) ? WR5_SEND_BREAK : 0) |
+-		(data & 0xc0) >> 1 |
++		// bits 7-6 count 5, 6, 7, 8 bits as RCVCTL does; WR5 swaps the 6 and 7 bit codes
++		(BIT(data, 6) ? 0x40 : 0) | (BIT(data, 7) ? 0x20 : 0) |
+ 		(m_wr5 & WR5_CRC16);
+ 	do_sioreg_wr5(control);
+ 	update_dtr_rts_break();
+--- a/src/mame/ericsson/a91.cpp
++++ b/src/mame/ericsson/a91.cpp
+@@ -189,6 +189,8 @@
+ 	bool m_tcc_rx_tail[4]{};
+ 
+ 	unsigned m_du_line = 0;
++	u8 m_du_portb = 0;
++	u8 m_tcc_station[4]{};
+ 	std::deque<std::vector<u8>> m_q_to_du, m_q_to_tcc;
+ 	emu_timer *m_ss3_to_du_timer = nullptr;
+ 	emu_timer *m_ss3_to_tcc_timer = nullptr;
+@@ -285,6 +287,24 @@
+ 	bool m_bridge = false;
+ 	bool m_bridge_xid_done = false;
+ 	std::vector<u8> m_bridge_rx;
++
++	// line 2: when the software sets MK68564 channel B up for bisync (the SASALFA host line of the
++	// SAS emulation), the socket carries that line instead: 7-bit characters both ways, without
++	// parity and SYN fill, the driver adding SYN SYN in front of each burst towards the A91
++	TIMER_CALLBACK_MEMBER(line2_clock);
++	void line2_tbit(int bit);
++	int line2_next_rbit();
++	emu_timer *m_l2_clk_timer = nullptr;
++	bool m_line2 = false;
++	bool m_l2_clk = false;
++	int m_l2_txd = 1;
++	u16 m_l2_tsr = 0xffff;
++	int m_l2_tcount = -1;
++	std::vector<u8> m_l2_out;
++	std::deque<u8> m_l2_rxq;
++	u16 m_l2_rsr = 0;
++	int m_l2_rbits = 0;
++	unsigned m_l2_idle = 16;
+ };
+ 
+ void a91_state::machine_start()
+@@ -316,6 +336,7 @@
+ 	m_host_timer = timer_alloc(FUNC(a91_state::host_poll), this);
+ 	m_host_bind_timer = timer_alloc(FUNC(a91_state::host_bind), this);
+ 	m_bridge_timer = timer_alloc(FUNC(a91_state::bridge_poll), this);
++	m_l2_clk_timer = timer_alloc(FUNC(a91_state::line2_clock), this);
+ 	m_x21_clk_timer->adjust(attotime::from_hz(9600 * 2), 0, attotime::from_hz(9600 * 2));
+ 	m_x21_dce_timer->adjust(attotime::from_seconds(50), DCE_READY);
+ 	if (m_ducpu)
+@@ -332,6 +353,13 @@
+ 	m_bridge = m_host_link && m_host_link->exists();
+ 	m_bridge_xid_done = false;
+ 	m_bridge_rx.clear();
++	m_line2 = false;
++	m_l2_clk_timer->adjust(attotime::never);
++	m_l2_tcount = -1;
++	m_l2_out.clear();
++	m_l2_rxq.clear();
++	m_l2_rbits = 0;
++	m_l2_idle = 16;
+ 	if (m_bridge)
+ 		m_bridge_timer->adjust(attotime::from_msec(1), 0, attotime::from_msec(1));
+ 	m_pgcr = 0;
+@@ -429,6 +457,8 @@
+ 		NAME([this](offs_t offset) { return m_tcc_control[offset]; }),
+ 		NAME([this](offs_t offset, u8 data) {
+ 			m_tcc_control[offset] = data;
++			if (offset == 7)
++				m_tcc_station[data >> 6] = data & 0x1f;
+ 			if (offset == 3)
+ 				subdevice<input_merger_device>("tccirq")->in_w<6>(BIT(data, 4));
+ 			if (offset == 1)
+@@ -578,6 +608,8 @@
+ void a91_state::tcc_control_w(offs_t offset, u8 data)
+ {
+ 	m_tcc_control[offset] = data;
++	if (offset == 7)
++		m_tcc_station[data >> 6] = data & 0x1f;
+ 	// Mailbox interrupt routing inferred from CP91OS/TCC91OS polling and acknowledgement.
+ 	if (offset == 3)
+ 		subdevice<input_merger_device>("tccirq")->in_w<6>(BIT(data, 4));
+@@ -612,6 +644,10 @@
+ 	// the four ADLCs share the display pair (TCC91OS polls on one and runs IPL sessions on another)
+ 	if (!m_ducpu)
+ 		return;
++	// the CP picks each channel's station through F0FFF7; the DU hears only its own
++	unsigned const station = m_config ? ((m_config->read() >> 2) & 0x1f) : 0;
++	if (m_tcc_station[CH] != station)
++		return;
+ 	m_q_to_tcc.clear();
+ 	m_ss3_to_tcc_timer->adjust(attotime::never);
+ 	m_du_dcd_timer->adjust(attotime::never);
+@@ -673,6 +709,11 @@
+ 
+ TIMER_CALLBACK_MEMBER(a91_state::du_carrier_tail)
+ {
++	// The IPL PROM takes any DCD change while it waits for a program block as the end of that
++	// block and falls back to a 63-byte window; the CP sends the next block up to ~80 ms after
++	// the DU's acknowledgement, so leave the PROM alone.
++	if (m_ducpu && m_ducpu->pc() >= 0xf800)
++		return;
+ 	m_du_adlc->set_dcd(1);
+ 	m_du_adlc->set_dcd(0);
+ }
+@@ -808,6 +849,16 @@
+ 
+ void a91_state::sio_w(offs_t offset, u8 data)
+ {
++	// channel B mode control: sync stop bits and a character sync mode = the bisync line 2
++	if (offset == 0x11 && !(data & 0x0c) && (data & 0x30) != 0x20 && m_bridge && !m_line2)
++	{
++		LOGX21("%.6f LINE2 bisync on channel B, the host socket now carries line 2\n", machine().time().as_double());
++		m_line2 = true;
++		m_l2_clk_timer->adjust(attotime::from_hz(19200 * 2), 0, attotime::from_hz(19200 * 2));
++		// a leased line with constant carrier: the SASALFA receiver drops everything without DCD
++		m_sio->dcdb_w(0);
++		m_sio->ctsb_w(0);
++	}
+ 	if (offset == 0x09 && m_dce == DCE_PROCEED)
+ 	{
+ 		char const ch = data & 0x7f;
+@@ -945,6 +996,71 @@
+ 	}
+ }
+ 
++TIMER_CALLBACK_MEMBER(a91_state::line2_clock)
++{
++	m_l2_clk = !m_l2_clk;
++	if (!m_l2_clk)
++	{
++		line2_tbit(m_l2_txd);
++		m_sio->rxb_w(line2_next_rbit());
++		m_sio->rxcb_w(0);
++		m_sio->txcb_w(0);
++	}
++	else
++	{
++		m_sio->rxcb_w(1);
++		m_sio->txcb_w(1);
++	}
++}
++
++void a91_state::line2_tbit(int bit)
++{
++	// characters go out LSB first: after SYN SYN the window holds 0x1616, then every 8 bits a character
++	m_l2_tsr = (m_l2_tsr >> 1) | (bit ? 0x8000 : 0);
++	if (m_l2_tcount < 0)
++	{
++		if (m_l2_tsr == 0x1616)
++			m_l2_tcount = 0;
++		return;
++	}
++	if (++m_l2_tcount < 8)
++		return;
++	m_l2_tcount = 0;
++	u8 const c = m_l2_tsr >> 8;
++	if (c == 0xff)
++	{
++		// marking: the transmitter has stopped
++		m_l2_tcount = -1;
++		return;
++	}
++	LOGX21("%.6f LINE2 tx %02X\n", machine().time().as_double(), c);
++	if ((c & 0x7f) != 0x16)
++		m_l2_out.push_back(c & 0x7f);
++}
++
++int a91_state::line2_next_rbit()
++{
++	if (!m_l2_rbits)
++	{
++		if (m_l2_rxq.empty())
++		{
++			if (m_l2_idle < 16)
++				m_l2_idle++;
++			return 1;
++		}
++		u8 const c = m_l2_rxq.front() & 0x7f;
++		m_l2_rxq.pop_front();
++		// odd parity in bit 7
++		m_l2_rsr = c | ((population_count_32(c) & 1) ? 0 : 0x80);
++		m_l2_rbits = 8;
++		m_l2_idle = 0;
++	}
++	int const bit = m_l2_rsr & 1;
++	m_l2_rsr >>= 1;
++	m_l2_rbits--;
++	return bit;
++}
++
+ u8 a91_state::x21_next_rbit()
+ {
+ 	switch (m_x21_rmode)
+@@ -1176,6 +1292,8 @@
+ 
+ void a91_state::bridge_from_a91(std::vector<u8> const &frame)
+ {
++	if (m_line2)
++		return;
+ 	if (!m_bridge_xid_done)
+ 	{
+ 		if (frame.size() >= 2 && (frame[1] & 0xef) == 0xaf)
+@@ -1196,9 +1314,21 @@
+ TIMER_CALLBACK_MEMBER(a91_state::bridge_poll)
+ {
+ 	u8 buf[1024];
++	if (m_line2 && !m_l2_out.empty())
++	{
++		m_host_link->fwrite(m_l2_out.data(), m_l2_out.size());
++		m_l2_out.clear();
++	}
+ 	u32 const n = m_host_link->input(buf, sizeof(buf));
+ 	if (!n)
+ 		return;
++	if (m_line2)
++	{
++		if (m_l2_idle >= 16)
++			m_l2_rxq.insert(m_l2_rxq.end(), { 0x16, 0x16, 0x16, 0x16 });
++		m_l2_rxq.insert(m_l2_rxq.end(), buf, buf + n);
++		return;
++	}
+ 	m_bridge_rx.insert(m_bridge_rx.end(), buf, buf + n);
+ 	for (;;)
+ 	{
+@@ -1475,6 +1605,24 @@
+ 
+ 	// row 24 is the DUOS status line, outside the 3270 presentation space
+ 	bool const status = y >= 24 * 16;
++	if (!status && BIT(m_du_portb, 5))
++	{
++		// two bytes per cell, attribute then character, at twice the CRTC address. SAS's D4GSAS writes only
++		// 0x84 (field start) and 0xBC (protected field) as attributes, and a Uniscope shows protected text like
++		// any other; its field delimiters (FS 0xA8, GS 0x80, EM 0x88, SUB 0xA0) take a position and show blank
++		address_space &space = m_ducpu->space(AS_PROGRAM);
++		for (int i = 0; i < x_count; i++)
++		{
++			offs_t const a = ((ma + i) * 2) & 0x7fff;
++			u8 const code = space.read_byte(a + 1);
++			u8 const chr = du_is_attribute(code) ? 0x20 : du_display_code(code);
++			u8 dots = m_du_chargen[(chr < 0x20 ? 0x20 : chr) * 16 + ra];
++			for (int n = 8; n > 0; n--, dots <<= 1)
++				*px++ = BIT(dots, 7) ? rgb_t::black() : rgb_t::white();
++			*px++ = rgb_t::black();
++		}
++		return;
++	}
+ 	bool hidden = false;
+ 	for (int k = 1; !status && k <= 1920; k++)
+ 	{
+@@ -1514,6 +1662,24 @@
+ 	PORT_CONFSETTING(0x01, "1")
+ 	PORT_CONFSETTING(0x02, "2")
+ 	PORT_CONFSETTING(0x03, "3")
++	// the station of the DU on its line; the SNA disks talk to station 0, SAS's SASALFA set to 1-7 and 13-15
++	PORT_CONFNAME(0x7c, 0x00, "Display unit station")
++	PORT_CONFSETTING(0x00, "0")
++	PORT_CONFSETTING(0x04, "1")
++	PORT_CONFSETTING(0x08, "2")
++	PORT_CONFSETTING(0x0c, "3")
++	PORT_CONFSETTING(0x10, "4")
++	PORT_CONFSETTING(0x14, "5")
++	PORT_CONFSETTING(0x18, "6")
++	PORT_CONFSETTING(0x1c, "7")
++	PORT_CONFSETTING(0x20, "8")
++	PORT_CONFSETTING(0x24, "9")
++	PORT_CONFSETTING(0x28, "10")
++	PORT_CONFSETTING(0x2c, "11")
++	PORT_CONFSETTING(0x30, "12")
++	PORT_CONFSETTING(0x34, "13")
++	PORT_CONFSETTING(0x38, "14")
++	PORT_CONFSETTING(0x3c, "15")
+ INPUT_PORTS_END
+ 
+ template <unsigned CH> void a91_state::tcc_wire_channel(machine_config &config)
+@@ -1579,7 +1745,7 @@
+ 	// RxRDY and TxRDY of channel A request DMAC channels 0 and 1 (DAR = data register)
+ 	sio.out_rxdrqa_callback().set(m_dmac, FUNC(hd63450_device::drq0_w));
+ 	sio.out_txdrqa_callback().set(m_dmac, FUNC(hd63450_device::drq1_w));
+-	sio.out_txdb_callback().set("rs232b", FUNC(rs232_port_device::write_txd));
++	sio.out_txdb_callback().set([this](int state) { m_l2_txd = state; subdevice<rs232_port_device>("rs232b")->write_txd(state); });
+ 	sio.out_dtrb_callback().set("rs232b", FUNC(rs232_port_device::write_dtr));
+ 	sio.out_rtsb_callback().set("rs232b", FUNC(rs232_port_device::write_rts));
+ 	rs232_port_device &rs232b(RS232_PORT(config, "rs232b", default_rs232_devices, nullptr));
+@@ -1633,6 +1799,7 @@
+ 	m_du_mic_pia->ca2_handler().set([this](int state) { du_irq_w<0>(state ? 0 : 1); });
+ 	m_du_mic_pia->irqa_handler().set(FUNC(a91_state::du_irq_w<1>));
+ 	m_du_mic_pia->writepa_handler().set([this](u8 data) { m_du_kbd->rst_line_w(BIT(data, 1) ? ASSERT_LINE : CLEAR_LINE); });
++	m_du_mic_pia->writepb_handler().set([this](u8 data) { m_du_portb = data; });
+ 	PIA6821(config, m_du_dia_pia);
+ 	ACIA6850(config, m_du_kbd_acia, 0);
+ 	m_du_kbd_acia->irq_handler().set(FUNC(a91_state::du_irq_w<3>));
+--- a/src/mame/skeleton/alfaskop_s41_kb.cpp
++++ b/src/mame/skeleton/alfaskop_s41_kb.cpp
+@@ -125,7 +125,7 @@
+ 	PORT_BIT( 0x0010, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("9 )") PORT_CODE(KEYCODE_9) PORT_CHAR('9') PORT_CHAR(')') // 52
+ 	PORT_BIT( 0x0020, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("0 =") PORT_CODE(KEYCODE_0) PORT_CHAR('0') PORT_CHAR('=') // 53
+ 	PORT_BIT( 0x0040, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("Field Mark") // 54
+-	PORT_BIT( 0x0080, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("Key 55 (0206)") // 55
++	PORT_BIT( 0x0080, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("Key 55 (0206) / SAS Cursor Home") PORT_CODE(KEYCODE_SLASH_PAD) // 55: Cursor Home in SAS's SASALFA terminal
+ 	PORT_BIT( 0x0100, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("T") PORT_CODE(KEYCODE_T) PORT_CHAR('t') PORT_CHAR('T') // 56
+ 	PORT_BIT( 0x0200, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("Y") PORT_CODE(KEYCODE_Y) PORT_CHAR('y') PORT_CHAR('Y') // 57
+ 	PORT_BIT( 0x0400, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("U") PORT_CODE(KEYCODE_U) PORT_CHAR('u') PORT_CHAR('U') // 58

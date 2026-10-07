@@ -1,0 +1,18 @@
+# console.py script: IPL OS/3 with the LNS supervisor, put the A91 on the IMS line, load ICAM C2 and run IMS
+wait SUPERVISOR UNLESS
+send \x1b\x0b W\x00\x0f\x1eLNS
+wait DATE\?
+send \x1b\x0b  \x00\x0f
+wait JOBS QUEUED
+exec python relay.py 127.0.0.1:9036 127.0.0.1:37523
+waitfile $A91_SAS_LOG == .* enter
+sleep 8
+attn
+sleep 3
+send \x1b\x0b/ \x00\x0f\x1eC2\x20
+wait ICAM READY
+attn
+sleep 3
+send \x1b\x0b/ \x00\x0f\x1eRV IMS\x20
+wait IMS READY
+log IMS is up

@@ -1,0 +1,21 @@
+--- a/src/devices/machine/z80sio.cpp
++++ b/src/devices/machine/z80sio.cpp
+@@ -2822,7 +2822,7 @@
+ 		xmtctl |= 0x10;
+ 	if (m_tx_auto_enable)
+ 		xmtctl |= 0x20;
+-	xmtctl |= (m_wr5 & WR5_TX_WORD_LENGTH_MASK) << 1;
++	xmtctl |= (m_wr5 & 0x40) | ((m_wr5 & 0x20) << 2);
+ 	return xmtctl;
+ }
+ 
+@@ -2839,7 +2839,8 @@
+ 		(BIT(data, 2) ? WR5_DTR : 0) |
+ 		(BIT(data, 3) ? WR5_TX_CRC_ENABLE : 0) |
+ 		(BIT(data, 4) ? WR5_SEND_BREAK : 0) |
+-		(data & 0xc0) >> 1 |
++		// bits 7-6 count 5, 6, 7, 8 bits as RCVCTL does; WR5 swaps the 6 and 7 bit codes
++		(BIT(data, 6) ? 0x40 : 0) | (BIT(data, 7) ? 0x20 : 0) |
+ 		(m_wr5 & WR5_CRC16);
+ 	do_sioreg_wr5(control);
+ 	update_dtr_rts_break();

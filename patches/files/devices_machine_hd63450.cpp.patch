@@ -1,0 +1,12 @@
+--- a/src/devices/machine/hd63450.cpp
++++ b/src/devices/machine/hd63450.cpp
+@@ -496,7 +496,8 @@
+ 			return;
+ 		}
+ 		m_timer[x]->adjust(attotime::never);
+-		m_reg[x].csr |= 0xe0;  // channel operation complete, block transfer complete
++		// a count that runs out is a normal end: COC only; NDT is for a device that ends the transfer early
++		m_reg[x].csr |= 0x80;  // channel operation complete
+ 		m_reg[x].csr &= ~0x08;  // channel no longer active
+ 		m_reg[x].ccr &= ~0xc0;
+ 
